@@ -26,6 +26,7 @@ struct whisper_params {
     int32_t n_threads  = std::min(4, (int32_t) std::thread::hardware_concurrency());
     int32_t prompt_ms  = 5000;
     int32_t command_ms = 8000;
+    int32_t stop_ms    = 10000;
     int32_t capture_id = -1;
     int32_t max_tokens = 32;
     int32_t audio_ctx  = 0;
@@ -47,6 +48,7 @@ struct whisper_params {
     std::string language  = "en";
     std::string model     = "models/ggml-base.en.bin";
     std::string fname_out;
+    std::string fname_act;
     std::string commands;
     std::string prompt;
     std::string context;
@@ -69,6 +71,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-t"   || arg == "--threads")       { params.n_threads     = std::stoi(argv[++i]); }
         else if (arg == "-pms" || arg == "--prompt-ms")     { params.prompt_ms     = std::stoi(argv[++i]); }
         else if (arg == "-cms" || arg == "--command-ms")    { params.command_ms    = std::stoi(argv[++i]); }
+        else if (arg == "-sms" || arg == "--stop-ms")       { params.stop_ms       = std::stoi(argv[++i]); }
         else if (arg == "-c"   || arg == "--capture")       { params.capture_id    = std::stoi(argv[++i]); }
         else if (arg == "-mt"  || arg == "--max-tokens")    { params.max_tokens    = std::stoi(argv[++i]); }
         else if (arg == "-ac"  || arg == "--audio-ctx")     { params.audio_ctx     = std::stoi(argv[++i]); }
@@ -82,6 +85,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-l"   || arg == "--language")      { params.language      = argv[++i]; }
         else if (arg == "-m"   || arg == "--model")         { params.model         = argv[++i]; }
         else if (arg == "-f"   || arg == "--file")          { params.fname_out     = argv[++i]; }
+        else if (arg == "-fa"  || arg == "--file-activation") { params.fname_act    = argv[++i]; }
         else if (arg == "-cmd" || arg == "--commands")      { params.commands      = argv[++i]; }
         else if (arg == "-p"   || arg == "--prompt")        { params.prompt        = argv[++i]; }
         else if (arg == "-ctx" || arg == "--context")       { params.context       = argv[++i]; }
@@ -107,6 +111,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -t N,       --threads N      [%-7d] number of threads to use during computation\n", params.n_threads);
     fprintf(stderr, "  -pms N,     --prompt-ms N    [%-7d] prompt duration in milliseconds\n",             params.prompt_ms);
     fprintf(stderr, "  -cms N,     --command-ms N   [%-7d] command duration in milliseconds\n",            params.command_ms);
+    fprintf(stderr, "  -sms N,     --stop-ms N      [%-7d] stops if no speech detected for duration in milliseconds\n", params.stop_ms);
     fprintf(stderr, "  -c ID,      --capture ID     [%-7d] capture device ID\n",                           params.capture_id);
     fprintf(stderr, "  -mt N,      --max-tokens N   [%-7d] maximum number of tokens per audio chunk\n",    params.max_tokens);
     fprintf(stderr, "  -ac N,      --audio-ctx N    [%-7d] audio context size (0 - all)\n",                params.audio_ctx);
@@ -120,6 +125,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -l LANG,    --language LANG  [%-7s] spoken language\n",                             params.language.c_str());
     fprintf(stderr, "  -m FNAME,   --model FNAME    [%-7s] model path\n",                                  params.model.c_str());
     fprintf(stderr, "  -f FNAME,   --file FNAME     [%-7s] text output file name\n",                       params.fname_out.c_str());
+    fprintf(stderr, "  -fa FNAME,   --file-activation FNAME [%-7s] file name for saved activation phrase\n", params.fname_act.c_str());
     fprintf(stderr, "  -cmd FNAME, --commands FNAME [%-7s] text file with allowed commands\n",             params.commands.c_str());
     fprintf(stderr, "  -p,         --prompt         [%-7s] the required activation prompt\n",              params.prompt.c_str());
     fprintf(stderr, "  -ctx,       --context        [%-7s] sample text to help the transcription\n",       params.context.c_str());
@@ -127,6 +133,23 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  --grammar-penalty N          [%-7.1f] scales down logits of nongrammar tokens\n",   params.grammar_penalty);
     fprintf(stderr, "  --suppress-regex REGEX       [%-7s] regular expression matching tokens to suppress\n", params.suppress_regex.c_str());
     fprintf(stderr, "\n");
+}
+
+static void save_vector(const std::vector<float>& vec, const std::string& filename) {
+    std::ofstream ofs(filename, std::ios::binary);
+    ofs.write(reinterpret_cast<const char*>(vec.data()), vec.size() * sizeof(float));
+    ofs.close();
+}
+
+static std::vector<float> load_vector(const std::string& filename) {
+    std::ifstream ifs(filename, std::ios::binary | std::ios::ate);
+    std::streamsize size = ifs.tellg();
+    ifs.seekg(0, std::ios::beg);
+
+    std::vector<float> vec(size / sizeof(float));
+    ifs.read(reinterpret_cast<char*>(vec.data()), size);
+    ifs.close();
+    return vec;
 }
 
 static std::string transcribe(
@@ -333,6 +356,7 @@ static int process_command_list(struct whisper_context * ctx, audio_async &audio
     fprintf(stderr, "\n");
 
     bool is_running  = true;
+    auto t_last_speech = std::chrono::high_resolution_clock::now();
 
     std::vector<float> pcmf32_cur;
     std::vector<float> pcmf32_prompt;
@@ -574,10 +598,29 @@ static int process_general_transcription(struct whisper_context * ctx, audio_asy
     fprintf(stderr, "\n");
     fprintf(stderr, "%s: general-purpose mode\n", __func__);
 
+    if (!params.fname_act.empty() && is_file_exist(params.fname_act.c_str())) {
+        fprintf(stdout, "%s: Loading activation phrase from '%s'\n", __func__, params.fname_act.c_str());
+        pcmf32_prompt = load_vector(params.fname_act);
+        pcmf32_cur = pcmf32_prompt;
+        ask_prompt = false;
+        have_prompt = true;
+    }
+
+    auto t_last_speech = std::chrono::high_resolution_clock::now();
+
     // main loop
     while (is_running) {
         // handle Ctrl + C
         is_running = sdl_poll_events();
+
+        // if no speech has been detected for the defined command_ms, then we stop
+        const auto t_now = std::chrono::high_resolution_clock::now();
+        const auto t_diff = std::chrono::duration_cast<std::chrono::milliseconds>(t_now - t_last_speech).count();
+        if (t_diff > params.stop_ms) {
+            fprintf(stdout, "%s: no speech detected for %d ms, stopping ...\n", __func__, params.stop_ms);
+            is_running = false;
+            continue;
+        }
 
         // delay
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -622,6 +665,11 @@ static int process_general_transcription(struct whisper_context * ctx, audio_asy
                         // save the audio for the prompt
                         pcmf32_prompt = pcmf32_cur;
                         have_prompt = true;
+
+                        if (!params.fname_act.empty()) {
+                            fprintf(stdout, "%s: Saving activation phrase to '%s'\n", __func__, params.fname_act.c_str());
+                            save_vector(pcmf32_prompt, params.fname_act);
+                        }
                     }
                 } else {
                     // we have heard the activation phrase, now detect the commands
@@ -678,6 +726,7 @@ static int process_general_transcription(struct whisper_context * ctx, audio_asy
                     fprintf(stdout, "\n");
                 }
 
+                t_last_speech = std::chrono::high_resolution_clock::now();
                 audio.clear();
             }
         }
